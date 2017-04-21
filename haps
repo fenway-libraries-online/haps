@@ -1,0 +1,143 @@
+#!/usr/bin/perl
+
+package Haps;
+
+use strict;
+use warnings;
+
+use constant ROOT => $ENV{'HAPS_ROOT'} || '/var/local/haps';
+
+sub usage;
+sub fatal;
+
+(our $prog = $0) =~ s{.+/}{};
+
+my $root = '/var/local/haps';
+
+Haps::app() if !caller;
+
+# Commands
+
+sub app {
+    goto &usage if !eval q{
+        use Getopt::Long qw(:config posix_default gnu_compat require_order bundling no_ignore_case);
+        1;
+    };
+    GetOptions(
+        'r|root=s' => \$root,
+    ) or goto &usage;
+    xchdir($root);
+    goto &usage if !@ARGV;
+    my $cmd = shift @ARGV;
+    exit 0 if eval {
+        &{ Haps->can("app_$cmd") or goto &usage };
+        1;
+    };
+    (my $errmsg = $@) =~ s/\n.+//msg;
+    fatal($errmsg);
+}
+
+sub app_ingest {
+    my $haps = Haps->new($root);
+    foreach my $src (@ARGV) {
+        my ($host, $path);
+        if ($src =~ m{^([^/:]+):(/.+)}) {
+            ($host, $path) = ($1, $2);
+        }
+        elsif ($src =~ m{^/}) {
+            $path = $src;
+        }
+        else {
+            fatal "source path is not absolute: $src";
+        }
+        print STDERR "Ingesting $src...";
+        my $batch;
+        eval {
+            $batch = $haps->ingest($host, $path);
+            print STDERR " Done: ", $batch->id, "\n";
+        } and next;
+        print STDERR " Failed\n";
+        exit 1;
+    }
+}
+
+# Methods
+
+sub new {
+    my ($cls, $root) = @_;
+    bless {
+        'root' => $root,
+    }, $cls;
+}
+
+sub ingest {
+    my ($self, $host, $path) = @_;
+    my $batch = $self->batch(
+        'source' => {
+            'host' => $host,
+            'path' => $path,
+        },
+    );
+    my $src = defined $host ? "$host:$path" : $path;
+    my $id = $batch->id;
+    my $pfx = substr($id, 0, 3);
+    my $tmp = "$root/batches/tmp/$id";
+    my $dst = "$tmp/root";
+    xmkdir($tmp, $dst);
+    xrun(qw(rsync -a -v), $src.'/', $dst.'/')
+        or fatal 'rsync failed';
+    if (!defined $host && -e "$src/md5.sum") {
+        xchdir($dst);
+        xrun(qw(md5deep -r -k -Fm), $src)
+            or fatal 'md5 check failed';
+        xchdir($root);
+    }
+    $self->postprocess($batch);
+    xrename($dst, "$root/batches/$pfx/$id");
+}
+
+sub postprocess {
+    my ($self, $batch) = @_;
+    1;
+}
+
+# Functions
+
+sub xopen {
+    my ($mode, $file) = @_;
+    open my $fh, $mode, $file or fatal "open $file: $!";
+    return $fh;
+}
+
+sub xchdir {
+    foreach (@_) {
+        chdir $_ or fatal "chdir $_: $!";
+    }
+}
+
+sub xrun {
+    my (@out, @err);
+    my ($in, $out, $err) = (
+        undef,
+        sub { print STDOUT @_; push @out, shift },
+        sub { print STDERR @_; push @err, shift },
+    );
+    $in  = shift if @_ && ref $_[0];
+    $out = shift if @_ && ref $_[0];
+    $err = shift if @_ && ref $_[0];
+    fatal "huh?" if !@_;
+    my $ret = run3([@_], $in, $out, $err) || $?;
+    return $ret == 0 if !wantarray;
+    return ($ret, \@out, \@err);
+}
+
+sub usage {
+    print STDERR "usage: $prog COMMAND [ARG...]\n";
+    exit 1;
+}
+
+sub fatal {
+    print STDERR "$prog: @_\n";
+    exit 2;
+}
+
