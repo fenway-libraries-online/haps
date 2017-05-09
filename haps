@@ -5,6 +5,8 @@ package Haps;
 use strict;
 use warnings;
 
+use Digest;
+
 use constant ROOT => $ENV{'HAPS_ROOT'} || '/var/local/haps';
 
 sub usage;
@@ -70,6 +72,15 @@ sub new {
     }, $cls;
 }
 
+sub root { @_ > 1 ? $_[0]->{'root'} = $_[1] : $_[0]->{'root'} }
+
+sub random_hex_string {
+    my $buf;
+    my $fh = xopen('<', '/dev/urandom');
+    read($fh, $buf, 4) or fatal "read /dev/urandom: $!";
+    return Digest->new('MD5')->add($$, localtime, $buf)->hexdigest;
+}
+
 sub ingest {
     my ($self, $host, $path) = @_;
     my $batch = $self->batch(
@@ -78,22 +89,26 @@ sub ingest {
             'path' => $path,
         },
     );
+    my $root = $self->root;
     my $src = defined $host ? "$host:$path" : $path;
     my $id = $batch->id;
     my $pfx = substr($id, 0, 3);
     my $tmp = "$root/batches/tmp/$id";
     my $dst = "$tmp/root";
     xmkdir($tmp, $dst);
-    xrun(qw(rsync -a -v), $src.'/', $dst.'/')
-        or fatal 'rsync failed';
+    xrun('rsync' => qw(rsync -a -v), $src.'/', $dst.'/');
     if (!defined $host && -e "$src/md5.sum") {
         xchdir($dst);
-        xrun(qw(md5deep -r -k -Fm), $src)
-            or fatal 'md5 check failed';
+        xrun('md5 check' => qw(md5deep -r -k -Fm), "$src/md5.sum");
         xchdir($root);
     }
     $self->postprocess($batch);
     xrename($dst, "$root/batches/$pfx/$id");
+}
+
+sub batch {
+    my $self = shift;
+    return Haps::Batch->new(@_);
 }
 
 sub postprocess {
@@ -116,6 +131,7 @@ sub xchdir {
 }
 
 sub xrun {
+    my $descrip = shift;
     my (@out, @err);
     my ($in, $out, $err) = (
         undef,
@@ -127,8 +143,9 @@ sub xrun {
     $err = shift if @_ && ref $_[0];
     fatal "huh?" if !@_;
     my $ret = run3([@_], $in, $out, $err) || $?;
-    return $ret == 0 if !wantarray;
-    return ($ret, \@out, \@err);
+    fatal "$descrip failed [$ret]: $!" if $ret != 0;
+    return \@out if !wantarray;
+    return (\@out, \@err);
 }
 
 sub usage {
@@ -141,3 +158,12 @@ sub fatal {
     exit 2;
 }
 
+package Haps::Batch;
+
+sub new {
+    my $cls = shift;
+    my $self = bless { @_ }, $cls;
+    $self->{'id'} ||= Haps->random_hex_string();
+}
+
+sub id { @_ > 1 ? $_[0]->{'id'} = $_[1] : $_[0]->{'id'} }
