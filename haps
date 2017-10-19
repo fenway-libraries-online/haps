@@ -41,21 +41,11 @@ sub app {
 
 sub app_ingest {
     my $haps = Haps->new($root);
-    foreach my $src (@ARGV) {
-        my ($host, $path);
-        if ($src =~ m{^([^/:]+):(/.+)}) {
-            ($host, $path) = ($1, $2);
-        }
-        elsif ($src =~ m{^/}) {
-            $path = $src;
-        }
-        else {
-            fatal "source path is not absolute: $src";
-        }
-        print STDERR "Ingesting $src...";
-        my $batch;
+    foreach my $dir (@ARGV) {
+        print STDERR "Ingesting $dir...";
         eval {
-            $batch = $haps->ingest($host, $path);
+            my $pkg = $haps->package($dir);
+            my $batch = $haps->ingest($pkg);
             print STDERR " Done: ", $batch->id, "\n";
         } and next;
         print STDERR " Failed\n";
@@ -82,24 +72,22 @@ sub random_hex_string {
 }
 
 sub ingest {
-    my ($self, $host, $path) = @_;
+    my ($self, $pkg) = @_;
+    $pkg->check;
     my $batch = $self->batch(
-        'source' => {
-            'host' => $host,
-            'path' => $path,
-        },
+        'package' => $pkg,
     );
     my $root = $self->root;
-    my $src = defined $host ? "$host:$path" : $path;
+    my $src = $pkg->root;
     my $id = $batch->id;
     my $pfx = substr($id, 0, 3);
     my $tmp = "$root/batches/tmp/$id";
     my $dst = "$tmp/root";
     xmkdir($tmp, $dst);
-    xrun('rsync' => qw(rsync -a -v), $src.'/', $dst.'/');
-    if (!defined $host && -e "$src/md5.sum") {
+    my ($ret, $out, $err) = xrun(qw(rsync -a -v), $src.'/', $dst.'/');
+    if (-e "$src/md5.sum") {
         xchdir($dst);
-        xrun('md5 check' => qw(md5deep -r -k -Fm), "$src/md5.sum");
+        xrun(qw(md5deep -r -k -Fm), "$src/md5.sum");
         xchdir($root);
     }
     $self->postprocess($batch);
@@ -143,9 +131,8 @@ sub xrun {
     $err = shift if @_ && ref $_[0];
     fatal "huh?" if !@_;
     my $ret = run3([@_], $in, $out, $err) || $?;
-    fatal "$descrip failed [$ret]: $!" if $ret != 0;
-    return \@out if !wantarray;
-    return (\@out, \@err);
+    return $ret if !wantarray;
+    return ($ret, \@out, \@err);
 }
 
 sub usage {
@@ -156,6 +143,50 @@ sub usage {
 sub fatal {
     print STDERR "$prog: @_\n";
     exit 2;
+}
+
+package Haps::Package;
+
+sub new {
+    my $cls = shift;
+    bless { @_ }, $cls;
+}
+
+sub check {
+    my ($self, $skip_md5deep) = @_;
+    $self->in(sub {
+        die 'required file is missing: md5sum.txt' if !-e 'md5sum.txt';
+        foreach (qw(files metadata haps/v1)) {
+            die "required directory is missing: $_" if !-d $_;
+        }
+        my @haps   = glob('haps/*');
+        my @hapsv1 = glob('haps/v1/*');
+        my @files  = glob('files/*');
+        die 'haps/ must not contain anything besides v1' if @haps > 1;
+        die 'haps/v1/ must be empty' if @hapsv1;
+        die 'files/ must not be empty' if !@files;
+        die 'required file is missing: metadata/metadata.txt or metadata/descrip.txt'
+            if !-e 'metadata/metadata.txt' && !-e 'metadata/descrip.txt';
+        if (!$skip_md5deep) {
+            my ($ret, $out, $err) = xrun(qw(md5deep -r -Fm -x md5sum.txt), @files);
+            die 'md5 verification failed: ', scalar(@$out), ' files'
+                if $ret != 0;
+        }
+    });
+}
+
+sub in {
+    my ($self, $code) = @_;
+    use Cwd;
+    my $cwd = cwd();
+    xchdir($self->root);
+    my $ok;
+    eval {
+        $code->();
+        chdir($cwd) or die "chdir $cwd: $!\n";
+        $ok = 1;
+    };
+    fatal $@ if !$ok;
 }
 
 package Haps::Batch;
