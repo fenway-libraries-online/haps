@@ -1,1 +1,6 @@
 doc/haps.pdf
+*.swp
+*.bak
+*.old
+*~
+old
