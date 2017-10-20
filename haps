@@ -195,6 +195,7 @@ sub new {
     my $cls = shift;
     my $self = bless { @_ }, $cls;
     $self->{'id'} ||= Haps->random_hex_string();
+    return $self;
 }
 
 sub id { @_ > 1 ? $_[0]->{'id'} = $_[1] : $_[0]->{'id'} }
