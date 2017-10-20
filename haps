@@ -151,9 +151,9 @@ sub new {
 sub id {
     my ($self) = @_;
     return $self->{'id'} if $self->{'id'};
-    my $fh = xopen '<', $self->root . '/md5.sum';
+    my $fh = xopen('<', $self->root . '/md5.sum');
     my $md5 = Digest->new('MD5')->addfile($fh)->hexdigest;
-    return $self=>{'id'} = lc $md5;
+    return $self->{'id'} = lc $md5;
 }
 
 sub check {
