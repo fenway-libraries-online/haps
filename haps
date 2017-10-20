@@ -81,16 +81,17 @@ sub in {
     fatal $@ if !$ok;
 }
 
-sub random_hex_string {
-    my $buf;
-    my $fh = xopen('<', '/dev/urandom');
-    read($fh, $buf, 4) or fatal "read /dev/urandom: $!";
-    return Digest->new('MD5')->add($$, localtime, $buf)->hexdigest;
-}
+### sub random_hex_string {
+###     my $buf;
+###     my $fh = xopen('<', '/dev/urandom');
+###     read($fh, $buf, 4) or fatal "read /dev/urandom: $!";
+###     return Digest->new('MD5')->add($$, localtime, $buf)->hexdigest;
+### }
 
 sub xopen {
     my ($mode, $file) = @_;
     open my $fh, $mode, $file or fatal "open $file: $!";
+    binmode $fh;
     return $fh;
 }
 
@@ -147,10 +148,18 @@ sub new {
     bless { @_ }, $cls;
 }
 
+sub id {
+    my ($self) = @_;
+    return $self->{'id'} if $self->{'id'};
+    my $fh = xopen '<', $self->root . '/md5.sum';
+    my $md5 = Digest->new('MD5')->addfile($fh)->hexdigest;
+    return $self=>{'id'} = lc $md5;
+}
+
 sub check {
-    my ($self, $skip_md5deep) = @_;
+    my ($self, $md5deep) = @_;
     Haps::in($self->root, sub {
-        die 'required file is missing: md5sum.txt' if !-e 'md5sum.txt';
+        die 'required file is missing: md5.sum' if !-e 'md5.sum';
         foreach (qw(files metadata haps/v1)) {
             die "required directory is missing: $_" if !-d $_;
         }
@@ -162,8 +171,8 @@ sub check {
         die 'files/ must not be empty' if !@files;
         die 'required file is missing: metadata/metadata.txt or metadata/descrip.txt'
             if !-e 'metadata/metadata.txt' && !-e 'metadata/descrip.txt';
-        if (!$skip_md5deep) {
-            my ($ret, $out, $err) = xrun(qw(md5deep -r -Fm -x md5sum.txt), @files);
+        if ($md5deep) {
+            my ($ret, $out, $err) = xrun(qw(md5deep -r -Fm -x md5.sum), @files);
             die 'md5 verification failed: ', scalar(@$out), ' files'
                 if $ret != 0;
         }
@@ -198,7 +207,7 @@ sub create {
 sub ingest {
     my ($self, $pkg) = @_;
     $pkg->check;
-    my $id = $pkg->{'id'} = Haps::random_hex_string();
+    my $id = $pkg->id;
     my $root = $self->root;
     my $src = $pkg->root;
     my $pfx = $self->prefix($id);
