@@ -8,130 +8,243 @@ use warnings;
 
 use Digest;
 use Cwd;
-
-use constant ROOT => $ENV{'HAPS_ROOT'} || '/var/local/haps';
-
-sub usage;
-sub fatal;
+use IPC::Run3;
 
 (our $prog = $0) =~ s{.+/}{};
 
-my $root = '/var/local/haps';
-my $repo;
-
+my %app;
 Haps::app() if !caller;
 
 # Commands
 
 sub app {
-    goto &usage if !eval q{
-        use Getopt::Long qw(:config posix_default gnu_compat require_order bundling no_ignore_case);
-        1;
-    };
-    GetOptions(
-        'r|root=s' => \$root,
-    ) or goto &usage;
-    xchdir($root);
-    goto &usage if !@ARGV;
-    $repo = Haps::Repository->new('.');
+    usage() if !@ARGV;
+    my @conf = grep { -e $_ } map { glob $_ } qw(~/.haps.conf ~/.config/haps/haps.conf);
+    $app{'config'} = @conf ? read_config_file($conf[0]) : {};
     my $cmd = shift @ARGV;
     exit 0 if eval {
-        &{ Haps->can("app_$cmd") or goto &usage };
+        &{ Haps->can("app_$cmd") or usage() };
         1;
     };
-    (my $errmsg = $@) =~ s/\n.+//msg;
+    (my $errmsg = $@) =~ s/\n.*//msg;
     fatal($errmsg);
 }
 
-sub app_ingest {
-    my $haps = Haps->new($root);
-    foreach my $dir (@ARGV) {
-        print STDERR "Ingesting $dir...";
-        eval {
-            my $pkg = $haps->package($dir);
-            $repo->ingest($pkg);
-            print STDERR " Done: ", $pkg->id, "\n";
-        } and next;
-        print STDERR " Failed\n";
-        exit 1;
-    }
+sub app_create {
+    usage() if @ARGV != 1;
+    my $repodir = repodir(shift @ARGV);
+    my $repo = Haps::Repository->create($repodir);
+    print STDERR "created: repository $repodir\n";
+    exit 0;
 }
 
-# Methods
+sub app_ingest {
+    usage() if @ARGV < 2;
+    my ($reponame, $pkgdir, @imeta) = @ARGV;
+    my $repodir = repodir($reponame);
+    my $agent = $app{'config'}{'agent'};
+    my %imeta;
+    $imeta{'agent.name'} = $agent->{'name'};
+    $imeta{'agent.email'} = $agent->{'email'};
+    foreach (@imeta) {
+        usage() if !/^([^=]+)=(.*)$/;
+        $imeta{$1} = $2;
+    }
+    die "agent name not set" if !defined $imeta{'agent.name'};
+    die "agent e-mail address not set" if !defined $imeta{'agent.email'};
+    my $repo = Haps::Repository->new($repodir);
+    print STDERR "ingesting $pkgdir\n";
+    my $pkg = Haps::Package->new($pkgdir);
+    $repo->ingest($pkg, \%imeta);
+    print $pkg->id, "\n";
+}
 
-sub new {
-    my ($cls, $root) = @_;
-    bless {
-        'root' => $root,
-    }, $cls;
+sub app_check {
+    usage() if @ARGV < 1;
+    my $repodir = repodir(shift @ARGV);
+    my $repo = Haps::Repository->new($repodir);
+    my $ok;
+    eval {
+        if (@ARGV == 0) {
+            $repo->check;
+            print "ok ", $repo->root, "\n";
+        }
+        else {
+            foreach my $pkgid (@ARGV) {
+                my $pkg = $repo->package($pkgid);
+                $pkg->check('in' => 'repository');
+                die "md5.sum has changed" if $pkg->id ne $pkgid;
+                print "ok $pkgid\n";
+            }
+        }
+        $ok = 1;
+    };
+    fatal($@) if !$ok;
 }
 
 # Functions
 
+sub repodir {
+    my ($reponame) = @_;
+    my $repodir = $app{'config'}{'repositories'}{$reponame};
+    return glob $repodir if defined $repodir;
+    return $reponame;
+}
+
+sub read_config_file {
+    my ($f) = @_;
+    my %config;
+    my $hash = \%config;
+    my $fh = xopen('<', $f);
+    while (<$fh>) {
+        if (/^\s*(?:#.*)?$/) {
+            # Skip blank lines and comments
+        }
+        elsif (/^\s*\[([^\]\s]+)\]$/) {
+            $hash = $config{$1} ||= {};
+        }
+        elsif (/^\s*([^\s=]+)(?:\s*=\s*|\s+)(.*)$/) {
+            $hash->{$1} = $2;
+        }
+        else {
+            die "invalid line $. in $f: $_";
+        }
+    }
+    return \%config;
+}
+
+sub agent_config {
+    my $f = glob('~/.haps/agent.conf');
+    return if !-e $f;
+    return read_config_file($f);
+}
+
+sub md5sort {
+    my ($f) = @_;
+    my $fh;
+    {
+        local $ENV{'LC_ALL'} = 'C';
+        open $fh, '-|', qw(sort -s), $f
+            or die "sort $f: $!";
+        binmode $fh;
+    }
+    my $md5 = Digest->new('MD5')->addfile($fh)->hexdigest;
+    return lc $md5;
+}
+
+sub md5 {
+    my ($f) = @_;
+    my $fh = Haps::xopen('<', $f);
+    my $md5 = Digest->new('MD5')->addfile($fh)->hexdigest;
+    return lc $md5;
+}
+
 sub in {
     my ($dir, $code) = @_;
     my $cwd = cwd();
-    xchdir($dir);
+    Haps::xchdir($dir);
     my $ok;
     eval {
         $code->();
         chdir($cwd) or die "chdir $cwd: $!\n";
         $ok = 1;
     };
-    fatal $@ if !$ok;
+    die $@ if !$ok;
 }
-
-### sub random_hex_string {
-###     my $buf;
-###     my $fh = xopen('<', '/dev/urandom');
-###     read($fh, $buf, 4) or fatal "read /dev/urandom: $!";
-###     return Digest->new('MD5')->add($$, localtime, $buf)->hexdigest;
-### }
 
 sub xopen {
     my ($mode, $file) = @_;
-    open my $fh, $mode, $file or fatal "open $file: $!";
+    open my $fh, $mode, $file or die "open $file: $!";
     binmode $fh;
     return $fh;
 }
 
 sub xchdir {
     foreach (@_) {
-        chdir $_ or fatal "chdir $_: $!";
+        chdir $_ or die "chdir $_: $!";
     }
 }
 
 sub xmkdir {
     foreach (@_) {
-        mkdir $_ or fatal "mkdir $_: $!";
+        -d $_ or mkdir $_ or die "mkdir $_: $!";
     }
 }
 
 sub xtouch {
     foreach my $f (@_) {
-        utime(undef, undef, $f) or die "utime $f: $!";
+        if (-e $f) {
+            utime(undef, undef, $f) or die "utime $f: $!";
+        }
+        else {
+            xopen('>', $f) or die "open $f: $!";
+        }
     }
 }
 
 sub xrun {
-    my $descrip = shift;
     my (@out, @err);
     my ($in, $out, $err) = (
         undef,
-        sub { print STDOUT @_; push @out, shift },
-        sub { print STDERR @_; push @err, shift },
+        sub { push @out, shift },
+        sub { push @err, shift },
     );
     $in  = shift if @_ && ref $_[0];
     $out = shift if @_ && ref $_[0];
     $err = shift if @_ && ref $_[0];
-    fatal "huh?" if !@_;
-    my $ret = run3([@_], $in, $out, $err) || $?;
+    die "huh?" if !@_;
+    run3([@_], $in, $out, $err);
+    my $ret = $?;
     return $ret if !wantarray;
     return ($ret, \@out, \@err);
 }
 
+sub xunlink {
+    foreach (@_) {
+        unlink $_ or die "unlink $_: $!";
+    }
+}
+
+sub xrmdir {
+    foreach (@_) {
+        rmdir $_ or die "rmdir $_: $!";
+    }
+}
+
+sub xrename {
+    my ($from, $to) = @_;
+    rename $from, $to or die "rename $from $to: $!";
+}
+
+sub xdir {
+    foreach (@_) {
+        die "no such directory: $_" if !-d $_;
+    }
+}
+
+sub xmkpath {
+    my @parts = (shift =~ m{(/?[^/]+)}g);
+    my $dir = shift @parts;
+    while (1) {
+        xmkdir($dir);
+        last if !@parts;
+        $dir .= shift @parts;
+    }
+}
+
+sub dirname {
+    local $_ = shift;
+    s{/[^/]+$}{};
+    return $_;
+}
+
 sub usage {
-    print STDERR "usage: $prog COMMAND [ARG...]\n";
+    print STDERR <<"EOS";
+usage:
+  $prog create REPODIR
+  $prog ingest REPODIR PKGDIR
+  $prog check REPODIR [PKGID...]
+EOS
     exit 1;
 }
 
@@ -145,34 +258,48 @@ package Haps::Package;
 
 sub new {
     my $cls = shift;
+    unshift @_, 'root' if @_ % 2;
     bless { @_ }, $cls;
 }
 
+sub root { return $_[0]{'root'} }
+
 sub id {
     my ($self) = @_;
-    return $self->{'id'} if $self->{'id'};
-    my $fh = xopen('<', $self->root . '/md5.sum');
-    my $md5 = Digest->new('MD5')->addfile($fh)->hexdigest;
-    return $self->{'id'} = lc $md5;
+    return $self->{'id'} ||= Haps::md5sort($self->root . '/md5.sum');
 }
 
 sub check {
-    my ($self, $md5deep) = @_;
+    my ($self, %arg) = @_;
+    my $in = $arg{'in'} || 'wild';
     Haps::in($self->root, sub {
+        if ($in eq 'wild') {
+            foreach (qw(haps/ingest.txt)) {
+                die "file $_ must not exist" if -e $_;
+            }
+        }
+        elsif ($in eq 'repository') {
+            foreach (qw(haps/ingest.txt)) {
+                die "missing file: $_" if !-e $_;
+            }
+        }
+        else {
+            die "internal error: $self->root is not in a repo or in in the wild?";
+        }
         die 'required file is missing: md5.sum' if !-e 'md5.sum';
-        foreach (qw(files metadata haps/v1)) {
+        foreach (qw(files metadata haps/v1pkg)) {
             die "required directory is missing: $_" if !-d $_;
         }
-        my @haps   = glob('haps/*');
-        my @hapsv1 = glob('haps/v1/*');
+        #my @haps   = glob('haps/*');
+        my @hapsv1 = glob('haps/v1pkg/*');
         my @files  = glob('files/*');
-        die 'haps/ must not contain anything besides v1' if @haps > 1;
-        die 'haps/v1/ must be empty' if @hapsv1;
+        #die 'haps/ must not contain anything besides v1pkg' if @haps > 1;
+        die 'haps/v1pkg/ must be empty' if @hapsv1;
         die 'files/ must not be empty' if !@files;
-        die 'required file is missing: metadata/metadata.txt or metadata/descrip.txt'
-            if !-e 'metadata/metadata.txt' && !-e 'metadata/descrip.txt';
-        if ($md5deep) {
-            my ($ret, $out, $err) = xrun(qw(md5deep -r -Fm -x md5.sum), @files);
+        die 'required file is missing: metadata/files.txt or metadata/descrip.txt'
+            if !-e 'metadata/files.txt' && !-e 'metadata/descrip.txt';
+        if ($arg{'md5'}) {
+            my ($ret, $out, $err) = Haps::xrun(qw(md5deep -r -l -k -Fm -x md5.sum), 'files', 'metadata');
             die 'md5 verification failed: ', scalar(@$out), ' files'
                 if $ret != 0;
         }
@@ -188,63 +315,80 @@ sub new {
     return bless { @_ }, $cls;
 }
 
+sub check {
+    my ($self) = @_;
+    # Check the repository itself
+    my $root = $self->root;
+    Haps::xdir($root);
+    Haps::xdir("$root/haps/v1repo");
+}
+
 sub create {
     my ($cls, $root) = @_;
     die "usage: Haps::Repository->create('/path/to/repo/root')" if @_ != 2;
     my $self = $cls->new('root' => $root);
     if (!-d $root) {
-        xmkdir($root);
+        Haps::xmkdir($root);
     }
     else {
         my @files = glob("$root/*");
         die "root $root is not empty" if @files;
     }
-    xmkdir("$root/packages", "$root/work", "$root/index", "$root/inventory");
-    xtouch("$root/work/haps.log");
+    Haps::xmkdir("$root/haps", "$root/haps/v1repo", "$root/packages", "$root/work", "$root/index", "$root/inventory");
     return $self;
 }
 
 sub ingest {
-    my ($self, $pkg) = @_;
-    $pkg->check;
+    my ($self, $pkg, $imeta) = @_;
+    $pkg->check('in' => 'wild');
     my $id = $pkg->id;
     my $root = $self->root;
     my $src = $pkg->root;
     my $pfx = $self->prefix($id);
-    my $tmp = "$root/work/$id";
-    my $dst = "$tmp/root";
-    Haps::xmkdir($tmp, $dst);
-    my ($ret, $out, $err) = xrun(qw(rsync -a -v), $src.'/', $dst.'/');
-    if (-e "$src/md5.sum") {
-        Haps::in($dst, sub {
-            xrun(qw(md5deep -r -k -Fm), "$src/md5.sum");
-        });
+    my $t0 = $imeta->{'timestamp'} = time;
+    my $tmp = "$root/work/$id.$t0.$$";
+    my $dst = "$root/packages/$pfx/$id";
+    if (-e $dst) {
+        die "package $id has already been ingested\n";
     }
-    xrename($dst, "$root/packages/$pfx/$id");
+    Haps::xmkdir($tmp);
+    my ($ret, $out, $err) = Haps::xrun(qw(rsync -a -v), $src.'/', $tmp.'/');
+    Haps::in($tmp, sub {
+        Haps::xrun(qw(md5deep -r -k -Fm), 'md5.sum');
+    });
+    my $fhlog = Haps::xopen('>', "$tmp/haps/ingest.log");
+    my $fhtxt = Haps::xopen('>', "$tmp/haps/ingest.txt");
+    printf $fhlog "%d ingest %s from %s\n", $t0, $id, $pkg->root;
+    foreach (sort keys %$imeta) {
+        print $fhtxt "$_ $imeta->{$_}\n";
+    }
+    Haps::xmkpath(Haps::dirname($dst));
+    Haps::xrename($tmp, $dst);
+    Haps::xrun(qw(chmod -R a-w), $dst);
     $self->postprocess($pkg);
 }
 
 sub root { @_ > 1 ? $_[0]->{'root'} = $_[1] : $_[0]->{'root'} }
 
 sub package {
-    my $self = shift;
-    return Haps::Package->new(@_);
+    my ($self, $pkgid) = @_;
+    return Haps::Package->new($self->find($pkgid));
+}
+
+sub find {
+    my ($self, $pkgid) = @_;
+    my $root = $self->root;
+    my $pfx = $self->prefix($pkgid);
+    return "$root/packages/$pfx/$pkgid";
 }
 
 sub prefix {
     my ($self, $id) = @_;
-    return substr($id, 0, 3);
+    return sprintf "%s/%s/%s", substr($id, 0, 1), substr($id, 1, 1), substr($id, 2, 1);
 }
 
 sub postprocess {
     my ($self, $pkg) = @_;
     1;
-}
-
-sub check {
-    my $self = shift;
-    foreach my $id (@_) {
-        ;
-    }
 }
 
